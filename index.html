@@ -4,13 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PEDP4 (DPHE Part) PCR Tool</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf-autotable/3.8.2/jspdf.plugin.autotable.min.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="libs/xlsx.full.min.js"></script>
+<script src="libs/exceljs.min.js"></script>
+<script src="libs/jspdf.umd.min.js"></script>
+<script src="libs/jspdf.plugin.autotable.min.js"></script>
+<script src="libs/firebase-app-compat.js"></script>
+<script src="libs/firebase-auth-compat.js"></script>
+<script src="libs/firebase-firestore-compat.js"></script>
+<script src="libs/docx.iife.js"></script>
 <style>
   :root{
     --navy:#123A5C;
@@ -129,7 +130,7 @@
   .dropzone .hint{ font-size:12px; color:var(--muted); margin-top:4px; }
   input[type=file]{ display:none; }
 
-  .filelist{ margin-top:14px; display:flex; flex-direction:column; gap:8px; }
+  .filelist{ margin-top:14px; display:flex; flex-direction:column; gap:8px; max-height:320px; overflow-y:auto; padding-right:4px; }
   .fileitem{
     display:flex; align-items:center; gap:10px; font-size:12.8px;
     border:1px solid var(--line); border-radius:8px; padding:9px 12px; background:#fff;
@@ -198,10 +199,10 @@
   .dl-group-title{ font-size:12px; font-weight:800; color:var(--navy-dark); margin:18px 0 8px; text-transform:uppercase; letter-spacing:.05em; }
   .dl-group-title:first-of-type{ margin-top:4px; }
   .dl-row{
-    display:flex; align-items:center; gap:12px; border:1px solid var(--line); border-left:5px solid var(--cat, var(--navy));
+    display:flex; align-items:center; gap:10px; flex-wrap:wrap; border:1px solid var(--line); border-left:5px solid var(--cat, var(--navy));
     border-radius:9px; padding:11px 14px; margin-bottom:8px; background:#FAFBFC;
   }
-  .dl-row .dl-label{ flex:1; font-size:13px; font-weight:700; color:var(--ink); }
+  .dl-row .dl-label{ flex:1; font-size:13px; font-weight:700; color:var(--ink); min-width:140px; }
   .dl-row .dl-count{ font-size:11px; color:var(--muted); font-weight:600; }
   .dl-btn{
     background:#fff; border:1.5px solid var(--cat, var(--navy)); color:var(--cat, var(--navy));
@@ -269,6 +270,7 @@
       <input type="file" id="fileInput" multiple accept=".xlsx,.xls">
     </div>
 
+    <input type="text" id="fileFilter" placeholder="Filter uploaded files by name…" style="width:100%; margin-top:12px; padding:8px 10px; border:1.5px solid var(--line); border-radius:7px; font-size:12.5px; font-family:inherit; display:none;">
     <div class="filelist" id="fileList"></div>
     <div class="storebar" id="storebar" style="display:none;">
       <span id="storeNote"></span>
@@ -346,12 +348,12 @@ if(typeof firebase === 'undefined'){
   document.getElementById('loginGate').innerHTML = `<div class="login-box">
     <div class="login-badge">DPHE</div>
     <h2 style="color:#C0392B;">Couldn't load required files</h2>
-    <p style="text-align:left;">The Firebase library files (from www.gstatic.com) didn't load — usually a blocked domain,
-    ad-blocker/extension, or offline connection. Check your network/firewall allows www.gstatic.com,
-    then reload this page. Opening this file directly (double-click) can also block remote scripts in some
-    browser security setups — try hosting it (e.g. GitHub Pages) instead if reloading doesn't help.</p>
+    <p style="text-align:left;">One of this page's own script files (in the <code>libs/</code> folder next to
+    index.html) didn't load. Make sure the <code>libs</code> folder was uploaded alongside index.html to your
+    GitHub repo with all its files intact, and that you're viewing the page over http(s), not by double-clicking
+    the file directly — some browsers block local script loading for file:// pages.</p>
   </div>`;
-  throw new Error('Firebase SDK failed to load from www.gstatic.com — see on-page message.');
+  throw new Error('Firebase SDK (libs/firebase-*-compat.js) failed to load — see on-page message.');
 }
 firebase.initializeApp(firebaseConfig);
 const auth = firebase.auth();
@@ -461,12 +463,52 @@ function rebuildAggregate(){
   const pkg = {WB:[], WS:[], MM:[], OFF:[]};
   for(const rec of fileRecords){
     for(const key of ['WB','WS','MM','OFF']){
-      school[key].push(...(rec.school[key] || []));
+      // tag each row with its source file's upload time so duplicates can be resolved by recency
+      const tagged = (rec.school[key] || []).map(r => ({...r, _uploadedAt: rec.uploadedAt || 0, _source: rec.name}));
+      school[key].push(...tagged);
       pkg[key].push(...(rec.pkg[key] || []));
     }
   }
+  // Dedup: if the same EMIS code (or, for Offices which have no EMIS, the same office
+  // name+district) shows up more than once across uploaded files — usually a district
+  // resubmitting a corrected file — keep only the most recently uploaded copy.
+  // Rows with a blank EMIS are left alone since there's no reliable key to match them on.
+  for(const key of ['WB','WS','MM']){
+    school[key] = dedupByKey(school[key], r => (r.emis || '').trim() || null);
+  }
+  school.OFF = dedupByKey(school.OFF, r => {
+    const n = (r.name||'').trim().toLowerCase(), d = (r.district||'').trim().toLowerCase();
+    return (n && d) ? `${n}|${d}` : null;
+  });
+
   state.school = school;
   state.pkg = pkg;
+}
+
+function dedupByKey(rows, keyFn){
+  const groups = new Map();
+  const unkeyed = [];
+  for(const r of rows){
+    const k = keyFn(r);
+    if(!k){ unkeyed.push(r); continue; }
+    if(!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(r);
+  }
+  const result = [...unkeyed];
+  for(const group of groups.values()){
+    const sources = new Set(group.map(r => r._source));
+    if(sources.size <= 1){
+      // All rows sharing this key came from the same uploaded file — e.g. a school with two
+      // separate water point installations under two different packages. Legitimate, keep both.
+      result.push(...group);
+    } else {
+      // Same key appears across two or more different file uploads — treat as a resubmission
+      // and keep only the rows from whichever file was uploaded most recently.
+      const latest = Math.max(...group.map(r => r._uploadedAt || 0));
+      result.push(...group.filter(r => (r._uploadedAt || 0) === latest));
+    }
+  }
+  return result;
 }
 
 function get(row, colIdx){ return colIdx ? row[colIdx-1] : undefined; }
@@ -664,9 +706,19 @@ function renderFileRow(rec){
   return row;
 }
 
+const fileFilterInput = document.getElementById('fileFilter');
+
 function renderAllFiles(){
   fileListEl.innerHTML = '';
-  fileRecords.slice().sort((a,b)=>a.uploadedAt-b.uploadedAt).forEach(rec => fileListEl.appendChild(renderFileRow(rec)));
+  const term = fileFilterInput.value.trim().toLowerCase();
+  const visible = fileRecords
+    .filter(rec => !term || rec.name.toLowerCase().includes(term))
+    .slice().sort((a,b)=>a.uploadedAt-b.uploadedAt);
+  visible.forEach(rec => fileListEl.appendChild(renderFileRow(rec)));
+  if(!visible.length && term){
+    fileListEl.innerHTML = `<p class="empty-note">No stored files match "${term}".</p>`;
+  }
+  fileFilterInput.style.display = fileRecords.length > 6 ? 'block' : 'none';
   if(fileRecords.length){
     storebar.style.display = 'flex';
     storeNote.textContent = `${fileRecords.length} file(s) in the shared database.`;
@@ -674,6 +726,7 @@ function renderAllFiles(){
     storebar.style.display = 'none';
   }
 }
+fileFilterInput.addEventListener('input', renderAllFiles);
 
 fileListEl.addEventListener('click', async (e)=>{
   const btn = e.target.closest('button.remove');
@@ -887,6 +940,29 @@ function downloadBlob(blob, filename){
 const NAVY = 'FF123A5C';
 const RED_BG = 'FFFCE4E4';
 
+// ---------- Shared report title block (4 centered lines, varies by work type) ----------
+const REPORT_TITLE_LINES = [
+  "Project Completion Report (PCR)",
+  "Fourth Primary Education Development Program (PEDP4)",
+  "Department of Public Health Engineering (DPHE)",
+];
+const WORK_TYPE_TITLE = {
+  WB: "Construction of Wash Block",
+  WS: "Construction of Water Source",
+  MM: "Major Maintenance of Wash Block",
+  OFF: "Construction of Offices (URC/PTI/DPEO)",
+};
+function getHeaderLines(key, isProcurement){
+  const line4 = isProcurement ? `Procurement of Works — ${WORK_TYPE_TITLE[key]}` : WORK_TYPE_TITLE[key];
+  return [...REPORT_TITLE_LINES, line4];
+}
+
+function sortPkg(pkgRows){
+  return [...pkgRows].sort((a,b)=>
+    String(a.package||'').localeCompare(String(b.package||''), undefined, {numeric:true, sensitivity:'base'})
+  );
+}
+
 function styleHeaderRow(row){
   row.eachCell(cell=>{
     cell.font = {bold:true, color:{argb:'FFFFFFFF'}, size:11, name:'Arial'};
@@ -902,6 +978,12 @@ function styleDataRow(row, flagged){
     if(flagged) cell.fill = {type:'pattern', pattern:'solid', fgColor:{argb:RED_BG}};
   });
 }
+function setPrintHeaderFooter(ws, headerLines){
+  ws.headerFooter = {
+    oddHeader: `&C&B${headerLines.join('\n')}`,
+    oddFooter: `&Cpg &P of pg &N`,
+  };
+}
 
 function appendixValueRow(def, i, r){
   const remarks = (r.phys!==100 && r.phys!==null && r.phys!==undefined && r.phys!=='') ? `Physical progress ${r.phys}%` : '';
@@ -916,6 +998,7 @@ async function downloadAppendixExcel(key){
   const rows = sortRows(state.school[key]);
   const workbook = new ExcelJS.Workbook();
   const ws = workbook.addWorksheet(def.label);
+  setPrintHeaderFooter(ws, getHeaderLines(key, false));
   styleHeaderRow(ws.addRow(def.headers));
   rows.forEach((r,i)=>{
     const dr = ws.addRow(appendixValueRow(def, i, r));
@@ -929,23 +1012,85 @@ async function downloadAppendixExcel(key){
   downloadBlob(new Blob([buf], {type:'application/octet-stream'}), `PCR_Appendix_${def.label.replace(/\s+/g,'_')}.xlsx`);
 }
 
+function pdfHeaderStartY(headerLines){
+  return 22 + headerLines.length*14 + 6;
+}
+function drawPdfHeader(doc, headerLines){
+  const pageWidth = doc.internal.pageSize.getWidth();
+  let y = 22;
+  headerLines.forEach((line, i)=>{
+    doc.setFontSize(i===3 ? 11.5 : 10.5);
+    doc.setFont(undefined, i<3 ? 'normal' : 'bold');
+    doc.text(line, pageWidth/2, y, {align:'center'});
+    y += 14;
+  });
+}
+function pdfPageNumbers(doc){
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const total = doc.internal.getNumberOfPages();
+  for(let i=1; i<=total; i++){
+    doc.setPage(i);
+    doc.setFontSize(8.5); doc.setFont(undefined,'normal');
+    doc.text(`pg ${i} of pg ${total}`, pageWidth/2, pageHeight-16, {align:'center'});
+  }
+}
+
 function downloadAppendixPdf(key){
   const def = APPENDIX_DEFS[key];
   const rows = sortRows(state.school[key]);
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({orientation:'landscape', unit:'pt', format:'a4'});
-  doc.setFontSize(13); doc.setFont(undefined,'bold');
-  doc.text(`Appendix — ${def.label}`, 28, 26);
-  doc.setFontSize(8); doc.setFont(undefined,'normal');
-  doc.text('PEDP4 (DPHE Part) Project Completion Report', 28, 38);
+  const headerLines = getHeaderLines(key, false);
   const body = rows.map((r,i)=>appendixValueRow(def, i, r).map(v=>v===null||v===undefined?'—':v));
   doc.autoTable({
-    head:[def.headers], body, startY:46, styles:{fontSize:7.5, cellPadding:3},
-    headStyles:{fillColor:[18,58,92], textColor:255, fontSize:8},
+    head:[def.headers], body, startY: pdfHeaderStartY(headerLines), styles:{fontSize:7.5, cellPadding:3},
+    headStyles:{fillColor:[18,58,92], textColor:255, fontSize:8, halign:'center'},
     alternateRowStyles:{fillColor:[245,246,248]},
-    margin:{left:28, right:28},
+    margin:{left:28, right:28, top:pdfHeaderStartY(headerLines)},
+    didDrawPage: ()=>{ drawPdfHeader(doc, headerLines); },
   });
+  pdfPageNumbers(doc);
   doc.save(`PCR_Appendix_${def.label.replace(/\s+/g,'_')}.pdf`);
+}
+
+async function downloadAppendixDocx(key){
+  const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, AlignmentType, Header, Footer, PageNumber, WidthType } = docx;
+  const def = APPENDIX_DEFS[key];
+  const rows = sortRows(state.school[key]);
+  const headerLines = getHeaderLines(key, false);
+
+  const headerParagraphs = headerLines.map((line, i) => new Paragraph({
+    alignment: AlignmentType.CENTER,
+    children: [new TextRun({ text: line, bold: true, size: i===3 ? 24 : 22 })],
+  }));
+  const footerPara = new Paragraph({
+    alignment: AlignmentType.CENTER,
+    children: [
+      new TextRun('pg '), new TextRun({ children:[PageNumber.CURRENT] }),
+      new TextRun(' of pg '), new TextRun({ children:[PageNumber.TOTAL_PAGES] }),
+    ],
+  });
+
+  const headRow = new TableRow({ children: def.headers.map(h => new TableCell({
+    children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: h, bold: true })] })],
+  })) });
+  const dataRows = rows.map((r,i) => new TableRow({ children: appendixValueRow(def, i, r).map(v => new TableCell({
+    children: [new Paragraph(v===null||v===undefined ? '' : String(v))],
+  })) }));
+
+  const table = new Table({ rows: [headRow, ...dataRows], width: {size:100, type: WidthType.PERCENTAGE} });
+
+  const doc = new Document({
+    sections: [{
+      properties: {},
+      headers: { default: new Header({ children: headerParagraphs }) },
+      footers: { default: new Footer({ children: [footerPara] }) },
+      children: [table],
+    }],
+  });
+  const blob = await Packer.toBlob(doc);
+  downloadBlob(blob, `PCR_Appendix_${def.label.replace(/\s+/g,'_')}.docx`);
 }
 
 const PROC_HEADERS = ['Package No','Description','Est. Cost (Lac Tk)','Stage',
@@ -973,8 +1118,9 @@ async function downloadProcurementExcel(key){
   const label = CATLABEL[key];
   const workbook = new ExcelJS.Workbook();
   const ws = workbook.addWorksheet(`Procurement - ${label}`.slice(0,31));
+  setPrintHeaderFooter(ws, getHeaderLines(key, true));
   styleHeaderRow(ws.addRow(PROC_HEADERS));
-  procRows(state.pkg[key]).forEach(vals => styleDataRow(ws.addRow(vals), false));
+  procRows(sortPkg(state.pkg[key])).forEach(vals => styleDataRow(ws.addRow(vals), false));
   const widths = [16,40,14,10,14,18,16,20,16,16,16,14,14,14,14,14,16,16];
   widths.forEach((w,idx)=>{ ws.getColumn(idx+1).width = w; });
   ws.views = [{state:'frozen', ySplit:1}];
@@ -986,17 +1132,54 @@ function downloadProcurementPdf(key){
   const label = CATLABEL[key];
   const { jsPDF } = window.jspdf;
   const doc = new jsPDF({orientation:'landscape', unit:'pt', format:'a4'});
-  doc.setFontSize(13); doc.setFont(undefined,'bold');
-  doc.text(`Annexure-1(b) — Procurement of Works: ${label}`, 24, 26);
-  doc.setFontSize(8); doc.setFont(undefined,'normal');
-  doc.text('PEDP4 (DPHE Part) Project Completion Report', 24, 38);
-  const body = procRows(state.pkg[key]).map(row => row.map(v=>(v===null||v===undefined||v==='')?'':v));
+  const headerLines = getHeaderLines(key, true);
+  const body = procRows(sortPkg(state.pkg[key])).map(row => row.map(v=>(v===null||v===undefined||v==='')?'':v));
   doc.autoTable({
-    head:[PROC_HEADERS], body, startY:46, styles:{fontSize:6.8, cellPadding:2.5},
-    headStyles:{fillColor:[18,58,92], textColor:255, fontSize:7.2},
-    margin:{left:20, right:20},
+    head:[PROC_HEADERS], body, startY: pdfHeaderStartY(headerLines), styles:{fontSize:6.8, cellPadding:2.5},
+    headStyles:{fillColor:[18,58,92], textColor:255, fontSize:7.2, halign:'center'},
+    margin:{left:20, right:20, top:pdfHeaderStartY(headerLines)},
+    didDrawPage: ()=>{ drawPdfHeader(doc, headerLines); },
   });
+  pdfPageNumbers(doc);
   doc.save(`PCR_Procurement_${label.replace(/[\s()\/]+/g,'_')}.pdf`);
+}
+
+async function downloadProcurementDocx(key){
+  const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, AlignmentType, Header, Footer, PageNumber, WidthType } = docx;
+  const label = CATLABEL[key];
+  const headerLines = getHeaderLines(key, true);
+
+  const headerParagraphs = headerLines.map((line, i) => new Paragraph({
+    alignment: AlignmentType.CENTER,
+    children: [new TextRun({ text: line, bold: true, size: i===3 ? 24 : 22 })],
+  }));
+  const footerPara = new Paragraph({
+    alignment: AlignmentType.CENTER,
+    children: [
+      new TextRun('pg '), new TextRun({ children:[PageNumber.CURRENT] }),
+      new TextRun(' of pg '), new TextRun({ children:[PageNumber.TOTAL_PAGES] }),
+    ],
+  });
+
+  const headRow = new TableRow({ children: PROC_HEADERS.map(h => new TableCell({
+    children: [new Paragraph({ alignment: AlignmentType.CENTER, children: [new TextRun({ text: h, bold: true })] })],
+  })) });
+  const dataRows = procRows(sortPkg(state.pkg[key])).map(vals => new TableRow({ children: vals.map(v => new TableCell({
+    children: [new Paragraph(v===null||v===undefined ? '' : String(v))],
+  })) }));
+
+  const table = new Table({ rows: [headRow, ...dataRows], width: {size:100, type: WidthType.PERCENTAGE} });
+
+  const wdoc = new Document({
+    sections: [{
+      properties: {},
+      headers: { default: new Header({ children: headerParagraphs }) },
+      footers: { default: new Footer({ children: [footerPara] }) },
+      children: [table],
+    }],
+  });
+  const blob = await Packer.toBlob(wdoc);
+  downloadBlob(blob, `PCR_Procurement_${label.replace(/[\s()\/]+/g,'_')}.docx`);
 }
 
 function renderDownloadArea(){
@@ -1013,6 +1196,7 @@ function renderDownloadArea(){
       <span class="dl-label">${APPENDIX_DEFS[key].label}</span>
       <span class="dl-count">${count} row${count===1?'':'s'}</span>
       <button class="dl-btn" data-kind="appendix-xlsx" data-key="${key}" ${count?'':'disabled'}>Excel</button>
+      <button class="dl-btn" data-kind="appendix-docx" data-key="${key}" ${count?'':'disabled'}>Word</button>
       <button class="dl-btn" data-kind="appendix-pdf" data-key="${key}" ${count?'':'disabled'}>PDF</button>`;
     appendixArea.appendChild(row);
 
@@ -1024,6 +1208,7 @@ function renderDownloadArea(){
       <span class="dl-label">Procurement — ${CATLABEL[key]}</span>
       <span class="dl-count">${pcount} package${pcount===1?'':'s'}</span>
       <button class="dl-btn" data-kind="proc-xlsx" data-key="${key}" ${pcount?'':'disabled'}>Excel</button>
+      <button class="dl-btn" data-kind="proc-docx" data-key="${key}" ${pcount?'':'disabled'}>Word</button>
       <button class="dl-btn" data-kind="proc-pdf" data-key="${key}" ${pcount?'':'disabled'}>PDF</button>`;
     procArea.appendChild(prow);
   }
@@ -1035,6 +1220,10 @@ document.getElementById('dlAppendixArea').addEventListener('click', async (e)=>{
   const key = btn.dataset.key;
   try{
     if(btn.dataset.kind === 'appendix-xlsx') await downloadAppendixExcel(key);
+    else if(btn.dataset.kind === 'appendix-docx'){
+      if(typeof docx === 'undefined'){ alert('The Word export library (libs/docx.iife.js) failed to load. Make sure the libs folder was uploaded alongside index.html, then reload the page.'); return; }
+      await downloadAppendixDocx(key);
+    }
     else if(btn.dataset.kind === 'appendix-pdf') downloadAppendixPdf(key);
   }catch(err){ alert('Could not build the file: ' + err.message); console.error(err); }
 });
@@ -1044,6 +1233,10 @@ document.getElementById('dlProcArea').addEventListener('click', async (e)=>{
   const key = btn.dataset.key;
   try{
     if(btn.dataset.kind === 'proc-xlsx') await downloadProcurementExcel(key);
+    else if(btn.dataset.kind === 'proc-docx'){
+      if(typeof docx === 'undefined'){ alert('The Word export library (libs/docx.iife.js) failed to load. Make sure the libs folder was uploaded alongside index.html, then reload the page.'); return; }
+      await downloadProcurementDocx(key);
+    }
     else if(btn.dataset.kind === 'proc-pdf') downloadProcurementPdf(key);
   }catch(err){ alert('Could not build the file: ' + err.message); console.error(err); }
 });
