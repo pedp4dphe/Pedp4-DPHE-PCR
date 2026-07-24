@@ -477,7 +477,7 @@ function rebuildAggregate(){
     school[key] = dedupByKey(school[key], r => (r.emis || '').trim() || null);
   }
   school.OFF = dedupByKey(school.OFF, r => {
-    const n = (r.name||'').trim().toLowerCase(), d = (r.district||'').trim().toLowerCase();
+    const n = String(r.name||'').trim().toLowerCase(), d = String(r.district||'').trim().toLowerCase();
     return (n && d) ? `${n}|${d}` : null;
   });
 
@@ -671,9 +671,22 @@ async function parseFile(file){
     }
   }
 
+  // Sanity check: "district" should always be text. If a meaningful share of rows in a
+  // category have a non-string district, the sheet's columns are very likely shifted
+  // relative to the expected layout — the exact failure mode that corrupted one real
+  // district's Water Source data silently before this check existed. Flag it instead of
+  // trusting it.
+  const layoutWarning = {WB:false, WS:false, MM:false, OFF:false};
+  for(const key of ['WB','WS','MM','OFF']){
+    const rows = school[key];
+    if(!rows.length) continue;
+    const bad = rows.filter(r => r.district !== null && r.district !== undefined && r.district !== '' && typeof r.district !== 'string').length;
+    if(bad / rows.length > 0.1) layoutWarning[key] = true;
+  }
+
   return {
     name: file.name, size: file.size, uploadedAt: Date.now(),
-    sheetsFound: sheetsFoundBool, counts, school, pkg,
+    sheetsFound: sheetsFoundBool, counts, school, pkg, layoutWarning,
   };
 }
 
@@ -699,9 +712,21 @@ function renderFileRow(rec){
   row.className = 'fileitem';
   row.dataset.name = rec.name;
   const missingSheets = Object.entries(rec.sheetsFound).filter(([k,v])=>!v).map(([k])=>CATLABEL[k]);
-  const tag = missingSheets.length ? `<span class="tag warn">check sheets</span>` : `<span class="tag ok">ok</span>`;
-  const detailParts = Object.entries(rec.counts).filter(([k,v])=>v>0).map(([k,v])=>`${CATLABEL[k]}: ${v}`);
-  const detail = detailParts.length ? detailParts.join(' · ') : (missingSheets.length ? `no recognizable sheets found` : 'no rows found');
+  const layoutWarning = rec.layoutWarning || {};
+  const shiftedCats = Object.entries(layoutWarning).filter(([k,v])=>v).map(([k])=>CATLABEL[k]);
+  let tag, detail;
+  if(shiftedCats.length){
+    tag = `<span class="tag warn" style="background:var(--red-bg); color:var(--red);">⚠ check columns</span>`;
+    detail = `${shiftedCats.join(', ')} looks like a different column layout — data may be misread. Remove and check the source file.`;
+  } else if(missingSheets.length){
+    tag = `<span class="tag warn">check sheets</span>`;
+    const detailParts = Object.entries(rec.counts).filter(([k,v])=>v>0).map(([k,v])=>`${CATLABEL[k]}: ${v}`);
+    detail = detailParts.length ? detailParts.join(' · ') : `no recognizable sheets found`;
+  } else {
+    tag = `<span class="tag ok">ok</span>`;
+    const detailParts = Object.entries(rec.counts).filter(([k,v])=>v>0).map(([k,v])=>`${CATLABEL[k]}: ${v}`);
+    detail = detailParts.length ? detailParts.join(' · ') : 'no rows found';
+  }
   row.innerHTML = `<span class="name">${rec.name}</span><span class="detail">${detail}</span>${tag}<button class="remove" title="Remove this file's data" data-name="${rec.name}">&times;</button>`;
   return row;
 }
@@ -817,9 +842,9 @@ function updateSummary(){
 
 function sortRows(rows){
   return [...rows].sort((a,b)=>{
-    return (a.district||'').localeCompare(b.district||'') ||
-           (a.upazila||'').localeCompare(b.upazila||'') ||
-           (a.name||'').localeCompare(b.name||'');
+    return String(a.district||'').localeCompare(String(b.district||'')) ||
+           String(a.upazila||'').localeCompare(String(b.upazila||'')) ||
+           String(a.name||'').localeCompare(String(b.name||''));
   });
 }
 
@@ -902,9 +927,9 @@ searchBtn.addEventListener('click', ()=>{
 
   const results = combinedIndex().filter(r =>
     (!type || r.cat===type) &&
-    (!district || (r.district||'').toLowerCase().includes(district)) &&
-    (!emis || (r.emis||'').toLowerCase().includes(emis)) &&
-    (!name || (r.name||'').toLowerCase().includes(name))
+    (!district || String(r.district||'').toLowerCase().includes(district)) &&
+    (!emis || String(r.emis||'').toLowerCase().includes(emis)) &&
+    (!name || String(r.name||'').toLowerCase().includes(name))
   );
 
   if(!results.length){
