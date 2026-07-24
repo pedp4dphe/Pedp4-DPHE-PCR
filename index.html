@@ -542,7 +542,11 @@ function extractRows(rows2D, layout, isOffice){
     const compA = get(row, layout.comp_a);
     if(d) cur.district = d;
     if(u) cur.upazila = u;
-    if(pkg){
+    if(pkg && pkg !== cur.package){
+      // A genuinely new package: some offices leave the package cell blank on the
+      // continuation rows under one package (Rajbari's style); others repeat the same
+      // value on every row for that package (Khagrachhari's style). Comparing against
+      // the previously seen value handles both — only a real change starts a new package.
       cur.package = pkg; cur.completion = compA; cur.desc = get(row, layout.desc);
       packageRows.push({
         district: cur.district, upazila: cur.upazila, package: pkg,
@@ -605,31 +609,110 @@ function scanSimpleSheet(ws){
         if(t.includes('upazila')) colMap.upazila = idx+1;
         if(t.includes('district')) colMap.district = idx+1;
         if((t.includes('construction') || t.includes('year')) && !colMap.year) colMap.year = idx+1;
+        if((t.includes('completion date') || t.includes('completion  date')) && !colMap.completionDate) colMap.completionDate = idx+1;
         if(t.includes('remarks')) colMap.remarks = idx+1;
         if(t.includes('details of office')) colMap.detail = idx+1;
+        if((t.includes('package id') || t.includes('package no') || t === 'package') && !colMap.package) colMap.package = idx+1;
+        if(t.includes('status') && !colMap.status) colMap.status = idx+1;
       });
       break;
     }
   }
-  if(headerRowIdx===-1 || !colMap.name) return [];
+  if(headerRowIdx===-1 || !colMap.name) return {schoolRows:[], packageRows:[]};
   const rows = [];
+  const packageMap = new Map();
   for(let r=headerRowIdx+2; r<=rows2D.length; r++){
     const row = rows2D[r-1] || [];
     const nameVal = row[colMap.name-1];
     if(!nameVal) continue;
     const remarksVal = colMap.remarks ? row[colMap.remarks-1] : '';
     if(String(remarksVal||'').toLowerCase().includes('delete this row')) continue;
+    const district = colMap.district ? (row[colMap.district-1]||'') : '';
+    const upazila = colMap.upazila ? (row[colMap.upazila-1]||'') : '';
+    // Year: prefer an explicit Construction Year column; fall back to a completion-date
+    // column if that's what this format actually records (many rows may still end up
+    // blank if the source genuinely never recorded a date — that's a real data gap,
+    // not something this can invent).
+    let year = colMap.year ? yearOf(row[colMap.year-1]) : '';
+    if(!year && colMap.completionDate) year = yearOf(row[colMap.completionDate-1]);
+    const status = colMap.status ? row[colMap.status-1] : '';
     rows.push({
+      district, upazila,
+      name: String(nameVal).trim(),
+      emis: colMap.emis ? String(row[colMap.emis-1]||'').trim() : '',
+      year,
+      detail: colMap.detail ? (row[colMap.detail-1]||'') : '',
+      phys: (status && String(status).toLowerCase().includes('complete')) ? 100 : null,
+    });
+    if(colMap.package){
+      const pkgVal = row[colMap.package-1];
+      if(pkgVal && !packageMap.has(pkgVal)){
+        packageMap.set(pkgVal, {
+          district, upazila, package: pkgVal,
+          tender:null, desc:null, cost:null,
+          pm_p:null,pm_a:null,pm_d:null, aa_p:null,aa_a:null,aa_d:null,
+          ti_p:null,ti_a:null,ti_d:null, newspaper:null,
+          op_p:null,op_a:null,op_d:null, ap_p:null,ap_a:null,ap_d:null,
+          noa_p:null,noa_a:null,noa_d:null,
+          cp:null,cpd:null,rp:null,rpd:null,pay:null,comp_c:null,comp_a:null,
+        });
+      }
+    }
+  }
+  return {schoolRows: rows, packageRows: [...packageMap.values()]};
+}
+
+// ---------- Missing-data corrections re-upload ----------
+// Recognizes the "Missing Data" file this tool itself exports (Work Type / Name / EMIS
+// Code / Upazila / District / Construction Year / Missing), so filling in the blanks and
+// re-uploading it actually feeds the corrections back in — a row only counts if the year
+// (or whatever was missing) has genuinely been filled in; still-blank rows are skipped so
+// they don't overwrite a fuller original record with a thinner one.
+function scanCorrectionsSheet(ws){
+  const rows2D = XLSX.utils.sheet_to_json(ws, {header:1, raw:true, defval:null});
+  let headerRowIdx = -1, colMap = {};
+  const limit = Math.min(6, rows2D.length);
+  for(let i=0;i<limit;i++){
+    const row = rows2D[i] || [];
+    const textRow = row.map(c => (c===null||c===undefined) ? '' : String(c).toLowerCase());
+    if(!textRow.some(t=>t.includes('work type'))) continue;
+    headerRowIdx = i;
+    textRow.forEach((t, idx)=>{
+      if(t.includes('work type')) colMap.worktype = idx+1;
+      if(t==='name' || t.includes('school name') || t.includes('office name')) colMap.name = idx+1;
+      if(t.includes('emis')) colMap.emis = idx+1;
+      if(t.includes('upazila')) colMap.upazila = idx+1;
+      if(t.includes('district')) colMap.district = idx+1;
+      if(t.includes('construction year') || t==='year') colMap.year = idx+1;
+    });
+    break;
+  }
+  if(headerRowIdx===-1 || !colMap.worktype || !colMap.name) return null;
+
+  const byCategory = {WB:[], WS:[], MM:[], OFF:[]};
+  for(let r=headerRowIdx+2; r<=rows2D.length; r++){
+    const row = rows2D[r-1] || [];
+    const nameVal = row[colMap.name-1];
+    const yearVal = colMap.year ? row[colMap.year-1] : null;
+    const emisVal = colMap.emis ? row[colMap.emis-1] : null;
+    // Require EMIS too, not just the year — EMIS is the only key the dedup logic can
+    // reliably match this row back to its original record with. A row still missing
+    // EMIS can't be safely merged here; including it would create a look-alike
+    // duplicate instead of fixing the original. Those need correcting at the source
+    // file instead (re-upload the full district file with EMIS filled in there).
+    if(!nameVal || !yearVal || !emisVal) continue;
+    const cat = guessCategory(String(row[colMap.worktype-1] || ''));
+    if(!cat) continue;
+    byCategory[cat].push({
       district: colMap.district ? (row[colMap.district-1]||'') : '',
       upazila: colMap.upazila ? (row[colMap.upazila-1]||'') : '',
       name: String(nameVal).trim(),
-      emis: colMap.emis ? String(row[colMap.emis-1]||'').trim() : '',
-      year: colMap.year ? yearOf(row[colMap.year-1]) : '',
-      detail: colMap.detail ? (row[colMap.detail-1]||'') : '',
-      phys: null,
+      emis: String(emisVal).trim(),
+      year: yearOf(yearVal),
+      detail: '', phys: null,
     });
   }
-  return rows;
+  return byCategory;
 }
 
 async function parseFile(file){
@@ -644,6 +727,19 @@ async function parseFile(file){
   const counts = {WB:0, WS:0, MM:0, OFF:0};
   const sheetsFoundBool = {WB:false, WS:false, MM:false, OFF:false};
 
+  // Missing-data corrections file (exported by this tool, filled in, re-uploaded)
+  for(const sn of wb.SheetNames){
+    const corrections = scanCorrectionsSheet(wb.Sheets[sn]);
+    if(!corrections) continue;
+    for(const key of ['WB','WS','MM','OFF']){
+      if(corrections[key].length){
+        school[key] = school[key].concat(corrections[key]);
+        counts[key] = (counts[key]||0) + corrections[key].length;
+        sheetsFoundBool[key] = true;
+      }
+    }
+  }
+
   for(const key of ['WB','WS','MM','OFF']){
     const sn = found[key];
     if(!sn) continue;
@@ -657,15 +753,17 @@ async function parseFile(file){
   }
 
   // Fallback: any unclaimed sheet whose name suggests a category and whose header
-  // row looks like a plain school list gets picked up too (school data only).
+  // row looks like a plain school list gets picked up too — including a package number
+  // if that column exists, even without full procurement tracking detail.
   const usedSheets = new Set(Object.values(found).filter(Boolean));
   for(const sn of wb.SheetNames){
     if(usedSheets.has(sn)) continue;
     const cat = guessCategory(sn);
     if(!cat) continue;
-    const extraRows = scanSimpleSheet(wb.Sheets[sn]);
+    const {schoolRows: extraRows, packageRows: extraPkgRows} = scanSimpleSheet(wb.Sheets[sn]);
     if(extraRows.length){
       school[cat] = school[cat].concat(extraRows);
+      pkg[cat] = pkg[cat].concat(extraPkgRows);
       counts[cat] = (counts[cat]||0) + extraRows.length;
       sheetsFoundBool[cat] = true;
     }
