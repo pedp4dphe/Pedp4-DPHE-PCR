@@ -586,7 +586,11 @@ function findSheet(wb, re){ return wb.SheetNames.find(n => re.test(n)); }
 // District, Construction Year, Remarks) without any procurement columns, and still have
 // it picked up — matched by header text rather than fixed column position.
 function guessCategory(sheetName){
-  const n = sheetName.toLowerCase();
+  const n = sheetName.trim().toLowerCase();
+  if(n === 'wb') return 'WB';
+  if(n === 'ws') return 'WS';
+  if(n === 'mm') return 'MM';
+  if(n === 'off') return 'OFF';
   if(n.includes('wash')) return 'WB';
   if(n.includes('water')) return 'WS';
   if(n.includes('maint')) return 'MM';
@@ -731,9 +735,11 @@ function scanCorrectionsSheet(ws){
 async function parseFile(file){
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, {type:'array', cellDates:true});
+  // Requires "...Data" so a bare "WB"/"WS"/"MM" sheet (the short-code convention for
+  // simpler files) isn't mistaken for the full PCR-tracking workbook's "WB Data" etc.
   const found = {
-    WB: findSheet(wb, /WB/i), WS: findSheet(wb, /WS/i),
-    MM: findSheet(wb, /MM/i), OFF: findSheet(wb, /Office/i),
+    WB: findSheet(wb, /WB\s*Data/i), WS: findSheet(wb, /WS\s*Data/i),
+    MM: findSheet(wb, /MM\s*Data/i), OFF: findSheet(wb, /Office/i),
   };
   const school = {WB:[], WS:[], MM:[], OFF:[]};
   const pkg = {WB:[], WS:[], MM:[], OFF:[]};
@@ -766,17 +772,18 @@ async function parseFile(file){
   }
 
   // Fallback: any unclaimed sheet whose name suggests a category and whose header
-  // row looks like a plain school list gets picked up too — including a package number
-  // if that column exists, even without full procurement tracking detail.
+  // row looks like a plain school list gets picked up too — including a Package ID
+  // if that column exists (kept on each school row for the appendix table), but NOT
+  // fed into the Procurement of Works analysis, which only draws from the full
+  // PCR-formatted tracking workbook (WB Data / WS Data / MM Data / Offices sheets).
   const usedSheets = new Set(Object.values(found).filter(Boolean));
   for(const sn of wb.SheetNames){
     if(usedSheets.has(sn)) continue;
     const cat = guessCategory(sn);
     if(!cat) continue;
-    const {schoolRows: extraRows, packageRows: extraPkgRows} = scanSimpleSheet(wb.Sheets[sn]);
+    const {schoolRows: extraRows} = scanSimpleSheet(wb.Sheets[sn]);
     if(extraRows.length){
       school[cat] = school[cat].concat(extraRows);
-      pkg[cat] = pkg[cat].concat(extraPkgRows);
       counts[cat] = (counts[cat]||0) + extraRows.length;
       sheetsFoundBool[cat] = true;
     }
