@@ -421,10 +421,10 @@ const CATCOLOR = {WB:"var(--teal)", WS:"var(--blue)", MM:"var(--amber)", OFF:"va
 
 // Official appendix formats, matched to the templates provided
 const APPENDIX_DEFS = {
-  WB: {label:"Wash Block", headers:["SL","School Name","EMIS Code","Upazila","District","Construction Year","Remarks"], hasEmis:true, hasDetail:false},
-  WS: {label:"Water Source", headers:["SL","School Name","EMIS Code","Upazila","District","Construction Year","Remarks"], hasEmis:true, hasDetail:false},
-  MM: {label:"Major Maintenance", headers:["SL","School Name","EMIS Code","Upazila","District","Construction Year","Remarks"], hasEmis:true, hasDetail:false},
-  OFF: {label:"Offices", headers:["SL","Office Name","Details of Office","Upazila","District","Construction Year","Remarks"], hasEmis:false, hasDetail:true},
+  WB: {label:"Wash Block", headers:["SL","District","Upazilla","Package ID","Contract Value","Name Of School","EMIS Code","Completion Year","Progress","Remarks"], hasEmis:true},
+  WS: {label:"Water Source", headers:["SL","District","Upazilla","Package ID","Contract Value","Name Of School","EMIS Code","Completion Year","Progress","Remarks"], hasEmis:true},
+  MM: {label:"Major Maintenance", headers:["SL","District","Upazilla","Package ID","Contract Value","Name Of School","EMIS Code","Completion Year","Progress","Remarks"], hasEmis:true},
+  OFF: {label:"Offices", headers:["SL","District","Upazilla","Package ID","Contract Value","Office Name","Completion Year","Progress","Remarks"], hasEmis:false},
 };
 
 // ---------- Persistent storage (Firestore, one document per uploaded file) ----------
@@ -533,7 +533,7 @@ function yearOf(v){
 
 // ---------- Complex (full tracking) layout extraction ----------
 function extractRows(rows2D, layout, isOffice){
-  let cur = {district:null, upazila:null, package:null, completion:null, desc:null};
+  let cur = {district:null, upazila:null, package:null, completion:null, desc:null, cp:null};
   let schoolRows = [], packageRows = [];
   const maxRow = rows2D.length;
   for(let r=4; r<=maxRow; r++){
@@ -548,6 +548,7 @@ function extractRows(rows2D, layout, isOffice){
       // value on every row for that package (Khagrachhari's style). Comparing against
       // the previously seen value handles both — only a real change starts a new package.
       cur.package = pkg; cur.completion = compA; cur.desc = get(row, layout.desc);
+      cur.cp = get(row, layout.cp);
       packageRows.push({
         district: cur.district, upazila: cur.upazila, package: pkg,
         tender: get(row,layout.tender), desc: get(row,layout.desc), cost: get(row,layout.cost),
@@ -571,6 +572,7 @@ function extractRows(rows2D, layout, isOffice){
         district: cur.district || '', upazila: cur.upazila || '',
         name: String(nameVal).trim(), emis: String(emis||'').trim(),
         year: yearOf(cur.completion), detail: cur.desc || '', phys: phys,
+        package: cur.package || '', contractValue: cur.cp ?? '', remarks: '',
       });
     }
   }
@@ -614,6 +616,7 @@ function scanSimpleSheet(ws){
         if(t.includes('details of office')) colMap.detail = idx+1;
         if((t.includes('package id') || t.includes('package no') || t === 'package') && !colMap.package) colMap.package = idx+1;
         if(t.includes('status') && !colMap.status) colMap.status = idx+1;
+        if(t.includes('progress') && !colMap.progressPct) colMap.progressPct = idx+1;
       });
       break;
     }
@@ -636,16 +639,26 @@ function scanSimpleSheet(ws){
     let year = colMap.year ? yearOf(row[colMap.year-1]) : '';
     if(!year && colMap.completionDate) year = yearOf(row[colMap.completionDate-1]);
     const status = colMap.status ? row[colMap.status-1] : '';
+    const pkgVal = colMap.package ? row[colMap.package-1] : '';
+    let phys = null;
+    if(colMap.progressPct){
+      const raw = row[colMap.progressPct-1];
+      const num = typeof raw === 'number' ? raw : parseFloat(String(raw||'').replace('%',''));
+      if(!isNaN(num)) phys = num;
+    }
+    if(phys===null && status) phys = String(status).toLowerCase().includes('complete') ? 100 : null;
     rows.push({
       district, upazila,
       name: String(nameVal).trim(),
       emis: colMap.emis ? String(row[colMap.emis-1]||'').trim() : '',
       year,
       detail: colMap.detail ? (row[colMap.detail-1]||'') : '',
-      phys: (status && String(status).toLowerCase().includes('complete')) ? 100 : null,
+      phys,
+      package: pkgVal ? String(pkgVal).trim() : '',
+      contractValue: '',
+      remarks: colMap.remarks ? String(remarksVal||'').trim() : '',
     });
     if(colMap.package){
-      const pkgVal = row[colMap.package-1];
       if(pkgVal && !packageMap.has(pkgVal)){
         packageMap.set(pkgVal, {
           district, upazila, package: pkgVal,
@@ -709,7 +722,7 @@ function scanCorrectionsSheet(ws){
       name: String(nameVal).trim(),
       emis: String(emisVal).trim(),
       year: yearOf(yearVal),
-      detail: '', phys: null,
+      detail: '', phys: null, package: '', contractValue: '', remarks: '',
     });
   }
   return byCategory;
@@ -1109,11 +1122,12 @@ function setPrintHeaderFooter(ws, headerLines){
 }
 
 function appendixValueRow(def, i, r){
-  const remarks = (r.phys!==100 && r.phys!==null && r.phys!==undefined && r.phys!=='') ? `Physical progress ${r.phys}%` : '';
-  if(def.hasDetail){
-    return [i+1, r.name, r.detail||'', r.upazila, r.district, r.year||'', remarks];
+  const progress = (r.phys!==null && r.phys!==undefined && r.phys!=='') ? `${r.phys}%` : '';
+  const remarks = r.remarks || '';
+  if(def.hasEmis){
+    return [i+1, r.district, r.upazila, r.package||'', r.contractValue||'', r.name, r.emis, r.year||'', progress, remarks];
   }
-  return [i+1, r.name, r.emis, r.upazila, r.district, r.year||'', remarks];
+  return [i+1, r.district, r.upazila, r.package||'', r.contractValue||'', r.name, r.year||'', progress, remarks];
 }
 
 async function downloadAppendixExcel(key){
@@ -1128,7 +1142,7 @@ async function downloadAppendixExcel(key){
     const flagged = (def.hasEmis && !r.emis) || !r.year;
     styleDataRow(dr, flagged);
   });
-  const widths = def.hasDetail ? [6,30,28,16,16,16,26] : [6,32,14,16,16,16,26];
+  const widths = def.hasEmis ? [6,16,16,16,16,28,14,14,10,26] : [6,16,16,16,16,28,14,10,26];
   widths.forEach((w,idx)=>{ ws.getColumn(idx+1).width = w; });
   ws.views = [{state:'frozen', ySplit:1}];
   const buf = await workbook.xlsx.writeBuffer();
