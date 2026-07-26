@@ -427,29 +427,112 @@ const APPENDIX_DEFS = {
   OFF: {label:"Offices", headers:["SL","District","Upazilla","Package ID","Contract Value","Office Name","Completion Year","Progress","Remarks"], hasEmis:false},
 };
 
-// ---------- Persistent storage (Firestore, one document per uploaded file) ----------
+// ---------- Persistent storage (Firestore) ----------
 // JSON round-tripping before writes strips `undefined` (Firestore rejects it) and turns
 // any Date objects into plain ISO strings, so reads never hand back Firestore Timestamp
 // objects — fmtDate()/yearOf() only ever see Dates, numbers, or strings, consistently.
+//
+// Firestore caps every document at 1 MiB. A single district file comfortably fits in
+// one document, but a national consolidated file (tens of thousands of rows) does not —
+// one real example came out to ~8.7 MB. So a file's data is split into a small
+// "manifest" document (name, counts, etc.) plus as many numbered chunk documents as
+// needed to stay under the limit, and reassembled on read. Small files still end up as
+// exactly one manifest + one chunk, so nothing changes for the common case.
 const FILES_COLLECTION = 'pcr_files';
+const CHUNK_BYTES = 700000; // headroom under Firestore's 1,048,576-byte document cap
 function sanitizeId(name){ return name.replace(/[^\w\-]/g, '_').slice(0, 300); }
+
+function packIntoChunks(school, pkg){
+  const flat = [];
+  for(const key of ['WB','WS','MM','OFF']){
+    (school[key]||[]).forEach(d => flat.push({t:'s', c:key, d}));
+    (pkg[key]||[]).forEach(d => flat.push({t:'p', c:key, d}));
+  }
+  const chunks = [];
+  let current = [], currentSize = 2;
+  for(const item of flat){
+    const itemSize = JSON.stringify(item).length + 1;
+    if(current.length && currentSize + itemSize > CHUNK_BYTES){
+      chunks.push(current); current = []; currentSize = 2;
+    }
+    current.push(item);
+    currentSize += itemSize;
+  }
+  chunks.push(current); // always at least one, even if empty
+  return chunks;
+}
 
 async function dbPutFile(record){
   const clean = JSON.parse(JSON.stringify(record));
-  await db.collection(FILES_COLLECTION).doc(sanitizeId(record.name)).set(clean);
+  const baseId = sanitizeId(clean.name);
+  const chunks = packIntoChunks(clean.school, clean.pkg);
+
+  // Clear out any chunks left over from a previous version of this same file — a
+  // re-upload can produce a different chunk count than before, so old ones beyond the
+  // new count would otherwise linger.
+  const oldChunks = await db.collection(FILES_COLLECTION).where('baseId', '==', baseId).get();
+
+  const ops = [];
+  oldChunks.docs.forEach(d => ops.push({type:'delete', ref:d.ref}));
+  ops.push({type:'set', ref: db.collection(FILES_COLLECTION).doc(baseId), data: {
+    isManifest: true, name: clean.name, size: clean.size, uploadedAt: clean.uploadedAt,
+    sheetsFound: clean.sheetsFound, counts: clean.counts, layoutWarning: clean.layoutWarning,
+    chunkCount: chunks.length,
+  }});
+  chunks.forEach((items, i) => {
+    ops.push({type:'set', ref: db.collection(FILES_COLLECTION).doc(`${baseId}__chunk${i}`), data: {
+      baseId, chunkIndex: i, items,
+    }});
+  });
+
+  // Firestore batches cap at 500 operations; split into multiple batches if needed
+  // (only relevant for extremely large files with many chunks).
+  for(let i=0; i<ops.length; i+=400){
+    const batch = db.batch();
+    ops.slice(i, i+400).forEach(op => {
+      if(op.type === 'delete') batch.delete(op.ref); else batch.set(op.ref, op.data);
+    });
+    await batch.commit();
+  }
 }
+
 async function dbGetAllFiles(){
   const snap = await db.collection(FILES_COLLECTION).get();
-  return snap.docs.map(d => d.data());
+  const manifests = [], chunksByBase = {};
+  snap.docs.forEach(d => {
+    const data = d.data();
+    if(data.isManifest){ manifests.push(data); }
+    else if(data.baseId){ (chunksByBase[data.baseId] = chunksByBase[data.baseId] || []).push(data); }
+  });
+  return manifests.map(m => {
+    const baseId = sanitizeId(m.name);
+    const chunks = (chunksByBase[baseId] || []).sort((a,b)=>a.chunkIndex-b.chunkIndex);
+    const school = {WB:[], WS:[], MM:[], OFF:[]}, pkg = {WB:[], WS:[], MM:[], OFF:[]};
+    chunks.forEach(c => (c.items||[]).forEach(item => {
+      (item.t === 's' ? school : pkg)[item.c].push(item.d);
+    }));
+    return {
+      name: m.name, size: m.size, uploadedAt: m.uploadedAt,
+      sheetsFound: m.sheetsFound, counts: m.counts, layoutWarning: m.layoutWarning,
+      school, pkg,
+    };
+  });
 }
 async function dbDeleteFile(name){
-  await db.collection(FILES_COLLECTION).doc(sanitizeId(name)).delete();
+  const baseId = sanitizeId(name);
+  const chunkSnap = await db.collection(FILES_COLLECTION).where('baseId', '==', baseId).get();
+  const batch = db.batch();
+  chunkSnap.docs.forEach(d => batch.delete(d.ref));
+  batch.delete(db.collection(FILES_COLLECTION).doc(baseId));
+  await batch.commit();
 }
 async function dbClearAll(){
   const snap = await db.collection(FILES_COLLECTION).get();
-  const batch = db.batch();
-  snap.docs.forEach(d => batch.delete(d.ref));
-  await batch.commit();
+  for(let i=0; i<snap.docs.length; i+=400){
+    const batch = db.batch();
+    snap.docs.slice(i, i+400).forEach(d => batch.delete(d.ref));
+    await batch.commit();
+  }
 }
 
 let fileRecords = [];
@@ -605,20 +688,23 @@ function scanSimpleSheet(ws){
   for(let i=0;i<limit;i++){
     const row = rows2D[i] || [];
     const textRow = row.map(c => (c===null||c===undefined) ? '' : String(c).toLowerCase());
-    const hasName = textRow.some(t=>t.includes('school name') || t.includes('office name'));
+    // Word-presence checks rather than exact phrases, so "School Name" and "Name Of
+    // School" (or any other word order) both match.
+    const hasName = textRow.some(t=>(t.includes('school') && t.includes('name')) || (t.includes('office') && t.includes('name')));
     const hasEmisOrDistrict = textRow.some(t=>t.includes('emis') || t.includes('district'));
     if(hasName && hasEmisOrDistrict){
       headerRowIdx = i;
       textRow.forEach((t, idx)=>{
-        if(t.includes('school name') || t.includes('office name')) colMap.name = idx+1;
+        if((t.includes('school') && t.includes('name')) || (t.includes('office') && t.includes('name'))) colMap.name = idx+1;
         if(t.includes('emis')) colMap.emis = idx+1;
-        if(t.includes('upazila')) colMap.upazila = idx+1;
+        if(t.includes('upazil')) colMap.upazila = idx+1;  // matches both "Upazila" and "Upazilla"
         if(t.includes('district')) colMap.district = idx+1;
-        if((t.includes('construction') || t.includes('year')) && !colMap.year) colMap.year = idx+1;
+        if((t.includes('construction') || (t.includes('year') && !t.includes('contract'))) && !colMap.year) colMap.year = idx+1;
         if((t.includes('completion date') || t.includes('completion  date')) && !colMap.completionDate) colMap.completionDate = idx+1;
         if(t.includes('remarks')) colMap.remarks = idx+1;
         if(t.includes('details of office')) colMap.detail = idx+1;
         if((t.includes('package id') || t.includes('package no') || t === 'package') && !colMap.package) colMap.package = idx+1;
+        if(t.includes('contract value') && !colMap.contractValue) colMap.contractValue = idx+1;
         if(t.includes('status') && !colMap.status) colMap.status = idx+1;
         if(t.includes('progress') && !colMap.progressPct) colMap.progressPct = idx+1;
       });
@@ -636,10 +722,10 @@ function scanSimpleSheet(ws){
     if(String(remarksVal||'').toLowerCase().includes('delete this row')) continue;
     const district = colMap.district ? (row[colMap.district-1]||'') : '';
     const upazila = colMap.upazila ? (row[colMap.upazila-1]||'') : '';
-    // Year: prefer an explicit Construction Year column; fall back to a completion-date
-    // column if that's what this format actually records (many rows may still end up
-    // blank if the source genuinely never recorded a date — that's a real data gap,
-    // not something this can invent).
+    // Year: prefer an explicit Construction/Completion Year column; fall back to a
+    // completion-date column if that's what this format actually records (many rows
+    // may still end up blank if the source genuinely never recorded a date — that's a
+    // real data gap, not something this can invent).
     let year = colMap.year ? yearOf(row[colMap.year-1]) : '';
     if(!year && colMap.completionDate) year = yearOf(row[colMap.completionDate-1]);
     const status = colMap.status ? row[colMap.status-1] : '';
@@ -659,7 +745,7 @@ function scanSimpleSheet(ws){
       detail: colMap.detail ? (row[colMap.detail-1]||'') : '',
       phys,
       package: pkgVal ? String(pkgVal).trim() : '',
-      contractValue: '',
+      contractValue: colMap.contractValue ? (row[colMap.contractValue-1] ?? '') : '',
       remarks: colMap.remarks ? String(remarksVal||'').trim() : '',
     });
     if(colMap.package){
