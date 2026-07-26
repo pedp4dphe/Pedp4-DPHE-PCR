@@ -485,11 +485,25 @@ async function dbPutFile(record){
     }});
   });
 
-  // Firestore batches cap at 500 operations; split into multiple batches if needed
-  // (only relevant for extremely large files with many chunks).
-  for(let i=0; i<ops.length; i+=400){
+  // Firestore batches cap at 500 operations AND at roughly 10MB of total request size —
+  // operation count alone isn't enough to stay safe when each chunk can be ~700KB, so
+  // batches are also split once their combined payload approaches a safe margin under
+  // that limit.
+  const MAX_BATCH_BYTES = 5000000;
+  let group = [], groupBytes = 0;
+  const groups = [];
+  for(const op of ops){
+    const opBytes = op.data ? JSON.stringify(op.data).length : 200;
+    if(group.length && (group.length >= 400 || groupBytes + opBytes > MAX_BATCH_BYTES)){
+      groups.push(group); group = []; groupBytes = 0;
+    }
+    group.push(op); groupBytes += opBytes;
+  }
+  if(group.length) groups.push(group);
+
+  for(const g of groups){
     const batch = db.batch();
-    ops.slice(i, i+400).forEach(op => {
+    g.forEach(op => {
       if(op.type === 'delete') batch.delete(op.ref); else batch.set(op.ref, op.data);
     });
     await batch.commit();
