@@ -476,7 +476,7 @@ async function dbPutFile(record){
   oldChunks.docs.forEach(d => ops.push({type:'delete', ref:d.ref}));
   ops.push({type:'set', ref: db.collection(FILES_COLLECTION).doc(baseId), data: {
     isManifest: true, name: clean.name, size: clean.size, uploadedAt: clean.uploadedAt,
-    sheetsFound: clean.sheetsFound, counts: clean.counts, layoutWarning: clean.layoutWarning,
+    sheetsFound: clean.sheetsFound, counts: clean.counts, pkgCounts: clean.pkgCounts, layoutWarning: clean.layoutWarning,
     chunkCount: chunks.length,
   }});
   chunks.forEach((items, i) => {
@@ -527,7 +527,9 @@ async function dbGetAllFiles(){
     }));
     return {
       name: m.name, size: m.size, uploadedAt: m.uploadedAt,
-      sheetsFound: m.sheetsFound, counts: m.counts, layoutWarning: m.layoutWarning,
+      sheetsFound: m.sheetsFound, counts: m.counts,
+      pkgCounts: m.pkgCounts || {WB: pkg.WB.length, WS: pkg.WS.length, MM: pkg.MM.length, OFF: pkg.OFF.length},
+      layoutWarning: m.layoutWarning,
       school, pkg,
     };
   });
@@ -1004,9 +1006,11 @@ async function parseFile(file){
     if(bad / rows.length > 0.1) layoutWarning[key] = true;
   }
 
+  const pkgCounts = {WB: pkg.WB.length, WS: pkg.WS.length, MM: pkg.MM.length, OFF: pkg.OFF.length};
+
   return {
     name: file.name, size: file.size, uploadedAt: Date.now(),
-    sheetsFound: sheetsFoundBool, counts, school, pkg, layoutWarning,
+    sheetsFound: sheetsFoundBool, counts, pkgCounts, school, pkg, layoutWarning,
   };
 }
 
@@ -1034,17 +1038,30 @@ function renderFileRow(rec){
   const missingSheets = Object.entries(rec.sheetsFound).filter(([k,v])=>!v).map(([k])=>CATLABEL[k]);
   const layoutWarning = rec.layoutWarning || {};
   const shiftedCats = Object.entries(layoutWarning).filter(([k,v])=>v).map(([k])=>CATLABEL[k]);
+  const pkgCounts = rec.pkgCounts || {WB:0, WS:0, MM:0, OFF:0};
+
+  function buildDetailParts(){
+    const parts = [];
+    for(const key of ['WB','WS','MM','OFF']){
+      const rows = rec.counts[key] || 0;
+      const pkgs = pkgCounts[key] || 0;
+      if(rows > 0) parts.push(`${CATLABEL[key]}: ${rows}`);
+      else if(pkgs > 0) parts.push(`${CATLABEL[key]}: ${pkgs} package${pkgs===1?'':'s'}`);
+    }
+    return parts;
+  }
+
   let tag, detail;
   if(shiftedCats.length){
     tag = `<span class="tag warn" style="background:var(--red-bg); color:var(--red);">⚠ check columns</span>`;
     detail = `${shiftedCats.join(', ')} looks like a different column layout — data may be misread. Remove and check the source file.`;
   } else if(missingSheets.length){
     tag = `<span class="tag warn">check sheets</span>`;
-    const detailParts = Object.entries(rec.counts).filter(([k,v])=>v>0).map(([k,v])=>`${CATLABEL[k]}: ${v}`);
+    const detailParts = buildDetailParts();
     detail = detailParts.length ? detailParts.join(' · ') : `no recognizable sheets found`;
   } else {
     tag = `<span class="tag ok">ok</span>`;
-    const detailParts = Object.entries(rec.counts).filter(([k,v])=>v>0).map(([k,v])=>`${CATLABEL[k]}: ${v}`);
+    const detailParts = buildDetailParts();
     detail = detailParts.length ? detailParts.join(' · ') : 'no rows found';
   }
   row.innerHTML = `<span class="name">${rec.name}</span><span class="detail">${detail}</span>${tag}<button class="remove" title="Remove this file's data" data-name="${rec.name}">&times;</button>`;
