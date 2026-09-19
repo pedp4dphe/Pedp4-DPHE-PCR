@@ -684,10 +684,10 @@ function findSheet(wb, re){ return wb.SheetNames.find(n => re.test(n)); }
 // it picked up — matched by header text rather than fixed column position.
 function guessCategory(sheetName){
   const n = sheetName.trim().toLowerCase();
-  if(n === 'wb') return 'WB';
-  if(n === 'ws') return 'WS';
-  if(n === 'mm') return 'MM';
-  if(n === 'off') return 'OFF';
+  if(n.startsWith('wb')) return 'WB';
+  if(n.startsWith('ws')) return 'WS';
+  if(n.startsWith('mm')) return 'MM';
+  if(n.startsWith('off')) return 'OFF';
   if(n.includes('wash')) return 'WB';
   if(n.includes('water')) return 'WS';
   if(n.includes('maint')) return 'MM';
