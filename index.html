@@ -682,6 +682,98 @@ function findSheet(wb, re){ return wb.SheetNames.find(n => re.test(n)); }
 // Lets a district send just a plain school list (School/Office Name, EMIS Code, Upazila,
 // District, Construction Year, Remarks) without any procurement columns, and still have
 // it picked up — matched by header text rather than fixed column position.
+// ---------- Package-wise procurement summary format ("PCR Format") ----------
+// A third distinct layout: one row per package, spanning a fixed Plan/Actual/Deviation
+// triple, with the stage embedded as a text prefix inside the cost cell ("Plan: 90.7")
+// rather than its own column, and no school-level breakdown at all. Explicitly a
+// procurement source (titled "...(PCR Format)"), so its packages do feed Procurement
+// of Works, unlike the plain school-list fallback format.
+function looksLikeProcurementSummary(rows2D){
+  const window = rows2D.slice(0, 8).flat().map(c => String(c||'').toLowerCase());
+  return window.some(t=>t.includes('package no')) && window.some(t=>t.includes('estimated cost')) && window.some(t=>t.includes('procurement method'));
+}
+function scanProcurementSummary(rows2D){
+  let headerIdx = -1, colMap = {};
+  for(let i=0; i<10 && i<rows2D.length; i++){
+    const row = (rows2D[i]||[]).map(c => String(c||'').toLowerCase());
+    if(row.some(t=>t.includes('package no'))){ headerIdx = i; break; }
+  }
+  if(headerIdx===-1) return [];
+  // The template spreads labels across this row and the one above it (a merged 2-row
+  // header), so check both.
+  const rowA = (rows2D[headerIdx-1]||[]).map(c => String(c||'').toLowerCase());
+  const rowB = (rows2D[headerIdx]||[]).map(c => String(c||'').toLowerCase());
+  const combined = rowB.map((t,i) => t || rowA[i] || '');
+  combined.forEach((t, idx)=>{
+    if(t.includes('package no')) colMap.package = idx+1;
+    if(t.includes('description')) colMap.desc = idx+1;
+    if(t.includes('estimated cost')) colMap.cost = idx+1;
+    if(t.includes('procurement method')) colMap.procMethod = idx+1;
+    if(t.includes('approving authority')) colMap.authority = idx+1;
+    if(t.includes('tender invitation')) colMap.tender = idx+1;
+    if(t.includes('newspaper')) colMap.newspaper = idx+1;
+    if(t.includes('opening')) colMap.opening = idx+1;
+    if(t.includes('approval')) colMap.approval = idx+1;
+    if(t.includes('noa')) colMap.noa = idx+1;
+    if(t.includes('contract price')) colMap.contract = idx+1;
+    if(t.includes('actual payment')) colMap.actualPay = idx+1;
+    if(t.includes('completion')){
+      if(!colMap.complContract) colMap.complContract = idx+1; else colMap.complActual = idx+1;
+    }
+  });
+  if(!colMap.package) return [];
+
+  // Skip a numbered "(1) (2) (3)..." row directly under the header, if present.
+  let r = headerIdx + 1;
+  const maybeNumRow = (rows2D[r]||[]).map(c => String(c||'').trim());
+  if(maybeNumRow.some(t => /^\(\d+\)$/.test(t))) r += 1;
+
+  const packages = [];
+  while(r < rows2D.length){
+    const row = rows2D[r] || [];
+    const pkgNo = colMap.package ? row[colMap.package-1] : null;
+    if(pkgNo){
+      const costCell = String(row[colMap.cost-1] || '');
+      const costMatch = costCell.match(/:\s*(-?[\d,]+\.?\d*)/);
+      const cost = costMatch ? parseFloat(costMatch[1].replace(/,/g,'')) : null;
+      const contractCell = String(row[colMap.contract-1] || '');
+      const cpMatch = contractCell.match(/^([\d,]+\.?\d*)\s*\(([^)]+)\)/);
+      const cp = cpMatch ? parseFloat(cpMatch[1].replace(/,/g,'')) : null;
+      const cpd = cpMatch ? cpMatch[2] : null;
+      const rpMatch = contractCell.match(/Revised:\s*([\d,]+\.?\d*)\s*\(([^)]+)\)/);
+      const rp = rpMatch ? parseFloat(rpMatch[1].replace(/,/g,'')) : null;
+      const rpd = rpMatch ? rpMatch[2] : null;
+      packages.push({
+        district:'', upazila:'', package: pkgNo,
+        tender: colMap.tender ? row[colMap.tender-1] : null,
+        desc: colMap.desc ? row[colMap.desc-1] : null,
+        cost,
+        pm_p: colMap.procMethod ? row[colMap.procMethod-1] : null,
+        pm_a: colMap.procMethod ? row[colMap.procMethod-1] : null, pm_d: null,
+        aa_p: colMap.authority ? row[colMap.authority-1] : null,
+        aa_a: colMap.authority ? row[colMap.authority-1] : null, aa_d: null,
+        ti_p: colMap.tender ? row[colMap.tender-1] : null,
+        ti_a: colMap.tender ? row[colMap.tender-1] : null, ti_d: null,
+        newspaper: colMap.newspaper ? row[colMap.newspaper-1] : null,
+        op_p: colMap.opening ? row[colMap.opening-1] : null,
+        op_a: colMap.opening ? row[colMap.opening-1] : null, op_d: null,
+        ap_p: colMap.approval ? row[colMap.approval-1] : null,
+        ap_a: colMap.approval ? row[colMap.approval-1] : null, ap_d: null,
+        noa_p: colMap.noa ? row[colMap.noa-1] : null,
+        noa_a: colMap.noa ? row[colMap.noa-1] : null, noa_d: null,
+        cp, cpd, rp, rpd,
+        pay: colMap.actualPay ? row[colMap.actualPay-1] : null,
+        comp_c: colMap.complContract ? row[colMap.complContract-1] : null,
+        comp_a: colMap.complActual ? row[colMap.complActual-1] : null,
+      });
+      r += 3;
+    } else {
+      r += 1;
+    }
+  }
+  return packages;
+}
+
 function guessCategory(sheetName){
   const n = sheetName.trim().toLowerCase();
   if(n.startsWith('wb')) return 'WB';
@@ -871,16 +963,26 @@ async function parseFile(file){
     sheetsFoundBool[key] = true;
   }
 
-  // Fallback: any unclaimed sheet whose name suggests a category and whose header
-  // row looks like a plain school list gets picked up too — including a Package ID
-  // if that column exists (kept on each school row for the appendix table), but NOT
-  // fed into the Procurement of Works analysis, which only draws from the full
-  // PCR-formatted tracking workbook (WB Data / WS Data / MM Data / Offices sheets).
+  // Fallback: any unclaimed sheet whose name suggests a category gets checked for two
+  // shapes — a package-wise procurement summary (see scanProcurementSummary; explicitly
+  // a procurement source, so it feeds Procurement of Works), or otherwise a plain school
+  // list (school data only, kept on each row's Package ID column but not fed into
+  // Procurement of Works, which otherwise only draws from the full PCR-formatted
+  // tracking workbook).
   const usedSheets = new Set(Object.values(found).filter(Boolean));
   for(const sn of wb.SheetNames){
     if(usedSheets.has(sn)) continue;
     const cat = guessCategory(sn);
     if(!cat) continue;
+    const rows2D = XLSX.utils.sheet_to_json(wb.Sheets[sn], {header:1, raw:true, defval:null});
+    if(looksLikeProcurementSummary(rows2D)){
+      const pkgRows = scanProcurementSummary(rows2D);
+      if(pkgRows.length){
+        pkg[cat] = pkg[cat].concat(pkgRows);
+        sheetsFoundBool[cat] = true;
+      }
+      continue;
+    }
     const {schoolRows: extraRows} = scanSimpleSheet(wb.Sheets[sn]);
     if(extraRows.length){
       school[cat] = school[cat].concat(extraRows);
